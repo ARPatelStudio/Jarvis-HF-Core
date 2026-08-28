@@ -16,7 +16,3 @@ __pycache__/
 firebase-credentials.json
 *.onnx
 *.wav
-
-# Render 1 Specific (Boss's Custom Values)
-PRODUCTION=true
-OPENROUTER_API_KEY=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
