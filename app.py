@@ -1,4 +1,13 @@
+import sys
 import uvicorn
+
+# 🚀 THE MONKEY PATCH: HF Anti-Crash Bypass
+# Gradio ko ullu banane ke liye hum ek fake HfFolder create kar rahe hain
+import huggingface_hub
+if not hasattr(huggingface_hub, "HfFolder"):
+    # Agar HfFolder delete ho chuka hai, toh ek dummy class inject kar do
+    huggingface_hub.HfFolder = type("HfFolder", (), {"get_token": lambda: None})
+
 import spaces
 from main import app
 
