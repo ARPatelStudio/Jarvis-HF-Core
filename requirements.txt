@@ -21,3 +21,4 @@ pinecone>=5.0.0
 pinecone-client
 sentence-transformers
 torch
+spaces
