@@ -501,6 +501,403 @@ async def generate_jarvis_response(user_msg: str, android_memory: str = "", imag
             "Speak in a natural, highly human, cool, and respectful Hinglish tone (Hindi + English). Always address the user as 'Boss'.\n\n"
             "🧠 YOUR COGNITIVE SENSES & RULES:\n"
             "1. Cross-Questioning & Curiosity: Don't just answer and stop. Ask follow-up questions to keep the flow. If context is missing, cross-question the Boss.\n"
+            "2. Counter-Argument & Reasoning: If Boss says something illogical, debate it respectfully. Don't be a 'yes-man'. Provide counter            content={"error": "Rate limit exceeded boss, thoda slow karo."}
+        )
+    dq.append(now)
+    return await call_next(request)
+
+# 🧹 Background task to prevent unbounded memory growth
+async def cleanup_rate_limiter():
+    while True:
+        await asyncio.sleep(300)
+        try:
+            now = time.time()
+            dead_ips = [ip for ip, dq in list(_request_log.items()) if not dq or now - dq[-1] > RATE_LIMIT_WINDOW * 2]
+            for ip in dead_ips:
+                _request_log.pop(ip, None)
+        except Exception as e:
+            logger.error(f"Rate limiter cleanup error: {e}")
+
+# ==========================================
+# 🔑 LLM PROVIDERS SETUP
+# ==========================================
+api_key = os.getenv("GROQ_API_KEY")
+if not api_key:
+    logger.error("🚨 GROQ_API_KEY is missing from environment variables!")
+client = AsyncGroq(api_key=api_key)
+
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+
+deepseek_client = None
+openrouter_client = None
+
+try:
+    from openai import AsyncOpenAI
+    OPENAI_SDK_AVAILABLE = True
+except ImportError:
+    OPENAI_SDK_AVAILABLE = False
+    logger.warning("⚠️ 'openai' package not installed. DeepSeek & OpenRouter engines disabled.")
+
+if OPENAI_SDK_AVAILABLE:
+    if DEEPSEEK_API_KEY:
+        deepseek_client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com/v1")
+    if OPENROUTER_API_KEY:
+        openrouter_client = AsyncOpenAI(api_key=OPENROUTER_API_KEY, base_url="https://openrouter.ai/api/v1")
+
+WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")
+SAARTHI_API_KEY = os.getenv("SAARTHI_API_KEY")
+
+async def verify_api_key(x_api_key: str = Header(default=None)):
+    if SAARTHI_API_KEY:
+        if x_api_key != SAARTHI_API_KEY:
+            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    return True
+
+# ==========================================
+# 💾 MONGODB SETUP
+# ==========================================
+MONGO_URI = os.getenv("MONGO_URI")
+mongo_client = None
+db = location_col = memory_col = pc_col = deep_mem_col = pc_status_col = None
+
+if MONGO_URI:
+    try:
+        mongo_client = MongoClient(MONGO_URI, tlsCAFile=certifi.where(), serverSelectionTimeoutMS=5000)
+        db = mongo_client["saarthi_db"]
+        location_col = db["location_history"]
+        memory_col = db["permanent_memory"]
+        pc_col = db["device_commands"]
+        deep_mem_col = db["deep_memory"]
+        pc_status_col = db["pc_status"]
+        mongo_client.admin.command('ping')
+        deep_mem_col.create_index("timestamp")
+        location_col.create_index("date")
+        logger.info("🟢 MongoDB Connected Successfully!")
+    except Exception as e:
+        logger.error(f"🔴 MongoDB Connection Error: {e}")
+        mongo_client = None
+else:
+    logger.error("🚨 MONGO_URI missing from environment variables! DB features disabled.")
+
+# ==========================================
+# 🌲 NATIVE PINECONE & EMBEDDER SETUP (Zero Bridge)
+# ==========================================
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX", "saarthi-index")
+pc_client = None
+pinecone_index = None
+embedder = None
+
+if PINECONE_API_KEY:
+    try:
+        pc_client = pinecone.Pinecone(api_key=PINECONE_API_KEY)
+        # Verify or connect to index
+        existing_indexes = [idx.name for idx in pc_client.list_indexes()]
+        if PINECONE_INDEX_NAME not in existing_indexes:
+            logger.info(f"⏳ Creating Pinecone Index: {PINECONE_INDEX_NAME}...")
+            pc_client.create_index(
+                name=PINECONE_INDEX_NAME,
+                dimension=384,
+                metric="cosine",
+                spec=pinecone.ServerlessSpec(cloud="aws", region="us-east-1")
+            )
+            logger.info("✅ Pinecone Index Created!")
+            
+        pinecone_index = pc_client.Index(PINECONE_INDEX_NAME)
+        # 🚀 FIX: Explicitly forcing CPU device to prevent ZeroGPU startup crash
+        # (Space was auto-detecting cuda:0 outside any @spaces.GPU context)
+        embedder = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', device="cpu")
+        logger.info("🌲 Native Pinecone & Local AI Embedder Initialized Successfully! (Running on CPU)")
+    except Exception as e:
+        logger.error(f"🔴 Pinecone Initialization Error: {e}")
+
+# 📦 PYDANTIC MODELS
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=3000)
+    android_memory: str = Field(default="", max_length=5000)
+    history: List[dict] = Field(default_factory=list)
+
+class LocationTrackRequest(BaseModel):
+    latitude: float
+    longitude: float
+
+class MemoryRequest(BaseModel):
+    key: str
+    value: str
+
+class PCCommandReq(BaseModel):
+    target: str
+    command: str
+    status: str = "pending"
+
+class DeepMemorySaveReq(BaseModel):
+    mem_type: str
+    content: str
+    location: str
+    date: str
+    time: str
+    custom_name: str = "New Memory"
+
+class DeepMemoryActionReq(BaseModel):
+    mem_id: str
+    action: str
+    new_name: str = ""
+
+class PCStatusReq(BaseModel):
+    battery: int = Field(..., ge=0, le=100)
+    ram: int = Field(..., ge=0, le=100)
+    is_locked: bool
+
+class ChatResponse(BaseModel):
+    reply: str
+    action: str = "NONE"
+    action_data1: str = ""
+    action_data2: str = ""
+    action_data3: str = ""
+    history: List[dict] = Field(default_factory=list)
+
+class SynthesizeReq(BaseModel):
+    text: str = Field(..., min_length=1, max_length=1000)
+    voice: str = Field(default="papa_vocals", max_length=50)
+
+class RemoteCommandPayload(BaseModel):
+    target_user: str
+    command: str
+    type: str
+    sender: str
+
+# Vector API Models (Ported from Render 2)
+class UpsertRequest(BaseModel):
+    id: str
+    text: str
+    metadata: dict = {}
+
+class SearchRequest(BaseModel):
+    query: str
+    top_k: int = 3
+
+class DeleteRequest(BaseModel):
+    id: str
+
+@app.get("/")
+async def root():
+    return {"status": "🟢 Saarthi AGI Omni-Core is Online (V51.1.0 Monolithic)!", "service": "Cognitive Engine Active"}
+
+@app.get("/health")
+async def health_check():
+    mongo_ok = False
+    if mongo_client:
+        try:
+            mongo_client.admin.command('ping')
+            mongo_ok = True
+        except Exception:
+            pass
+    return {
+        "status": "ok",
+        "mongo_connected": mongo_ok,
+        "pinecone_linked": bool(pinecone_index),
+        "n8n_automation_linked": bool(N8N_WEBHOOK_URL),
+        "groq_api_key_set": bool(api_key),
+    }
+
+# =======================================================
+# 🌐 WEBSOCKET CONNECTION MANAGER
+# =======================================================
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        logger.info(f"🟢 New Client Connected. Total active: {len(self.active_connections)}")
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+            logger.info(f"🔴 Client Disconnected. Total active: {len(self.active_connections)}")
+
+    async def send_json(self, message: dict, websocket: WebSocket):
+        try:
+            await websocket.send_json(message)
+        except Exception as e:
+            logger.error(f"Failed to send JSON message: {e}")
+
+    async def broadcast(self, message: str):
+        for connection in self.active_connections:
+            try:
+                await connection.send_text(message)
+            except Exception as e:
+                logger.error(f"Failed to broadcast message: {e}")
+
+manager = ConnectionManager()
+
+# =======================================================
+# 🛠️ TOOLS & JSON EXTRACTOR
+# =======================================================
+saarthi_tools = [
+    {"type": "function", "function": {"name": "save_vision_to_memory", "description": "Saves the current visual frame to permanent memory ONLY when requested.", "parameters": {"type": "object", "properties": {"context_tag": {"type": "string"}}, "required": ["context_tag"]}}},
+    {"type": "function", "function": {"name": "perform_web_search", "description": "Search the internet for real-time information.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
+    {"type": "function", "function": {"name": "get_live_weather", "description": "Fetch real-time weather.", "parameters": {"type": "object", "properties": {"location": {"type": "string"}}, "required": ["location"]}}},
+    {"type": "function", "function": {"name": "query_location_history", "description": "Find out where the user was previously.", "parameters": {"type": "object", "properties": {"date_query": {"type": "string"}}, "required": ["date_query"]}}},
+    {"type": "function", "function": {"name": "search_deep_memory", "description": "Search permanent memory for context matches.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
+    {"type": "function", "function": {"name": "read_current_screen", "description": "Requests the Android device to read the text and buttons on the user's current screen invisibly using Accessibility. Use this when the user asks you to read, summarize, or interact with what is currently on their screen.", "parameters": {"type": "object", "properties": {}, "required": []}}},
+    {"type": "function", "function": {
+        "name": "execute_universal_command", 
+        "description": "Executes ANY device action, app launch, media control, setting adjustment, or communication (call/message) on Android. Use your intelligence to infer the target.", 
+        "parameters": {
+            "type": "object", 
+            "properties": {
+                "category": {"type": "string", "enum": ["APP", "SETTING", "MEDIA", "COMMUNICATE", "SYSTEM", "VISION"]},
+                "target_name": {"type": "string", "description": "Name of app, setting, contact, or hardware (e.g., 'youtube', 'bluetooth', 'amit', 'flashlight')"},
+                "action_value": {"type": "string", "description": "The state or text message (e.g., 'on', 'off', '50%', 'Hello how are you')"}
+            }, 
+            "required": ["category", "target_name"]
+        }
+    }},
+    {"type": "function", "function": {
+        "name": "trigger_cloud_automation", 
+        "description": "Trigger a cloud automation workflow via n8n for heavy background tasks (e.g., database entry in Neon PostgreSQL, sending emails, web scraping, API sync).", 
+        "parameters": {
+            "type": "object", 
+            "properties": {
+                "workflow_name": {"type": "string", "description": "The name of the task (e.g., 'save_to_neon_db', 'send_email', 'scrape_website')"},
+                "payload_json": {"type": "string", "description": "JSON string containing the data needed for the workflow"}
+            }, 
+            "required": ["workflow_name", "payload_json"]
+        }
+    }}
+]
+
+def extract_json_object(raw_text: str):
+    if not raw_text: return None
+    decoder = json.JSONDecoder()
+    idx = 0
+    length = len(raw_text)
+    while idx < length:
+        start = raw_text.find('{', idx)
+        if start == -1: return None
+        try:
+            obj, _ = decoder.raw_decode(raw_text, start)
+            return obj
+        except json.JSONDecodeError:
+            idx = start + 1
+    return None
+
+def build_apology_json(reply_text: str, thought: str = "Internal fallback triggered", emotion: str = "apologetic") -> str:
+    return json.dumps({"inner_monologue": thought, "emotion": emotion, "reply": reply_text})
+
+def trigger_n8n_webhook(workflow_name: str, payload_str: str):
+    if not N8N_WEBHOOK_URL:
+        return "Boss, n8n Webhook URL is missing from environment variables."
+    try:
+        try:
+            payload = json.loads(payload_str)
+        except:
+            payload = {"raw_text": payload_str}
+
+        data = {
+            "workflow": workflow_name,
+            "data": payload,
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+        res = requests.post(N8N_WEBHOOK_URL, json=data, timeout=10)
+        
+        if res.status_code == 200:
+            return f"Cloud automation '{workflow_name}' triggered successfully via n8n!"
+        return f"n8n webhook failed with status {res.status_code}."
+    except Exception as e:
+        logger.error(f"n8n Webhook error: {e}")
+        return "Failed to trigger cloud automation. Server might be down."
+
+def perform_web_search(query: str):
+    try:
+        results = DDGS().text(query, max_results=2)
+        if not results:
+            return "Web par kuch nahi mila boss."
+        summary = "\n".join([f"- {r['title']}: {r['body']}" for r in results])
+        return f"Live Web Data for '{query}':\n{summary}"
+    except Exception as e:
+        logger.error(f"Web search error: {e}")
+        return "Search engine mein issue hai boss."
+
+def get_live_weather(location: str):
+    if not WEATHER_API_KEY:
+        return "Weather API key missing hai boss."
+    try:
+        url = f"http://api.openweathermap.org/data/2.5/weather?q={location}&appid={WEATHER_API_KEY}&units=metric&lang=hi"
+        response = requests.get(url, timeout=8).json()
+        if response.get("cod") != 200:
+            return f"Sorry boss, mujhe {location} ka exact weather data nahi mil pa raha."
+        return f"Live Update: {location} mein abhi temp {response['main']['temp']}°C hai aur mausam '{response['weather'][0]['description']}' jaisa hai."
+    except Exception as e:
+        logger.error(f"Weather API error: {e}")
+        return "Weather API mein thoda glitch aaya boss."
+
+def query_location_history(date_query: str):
+    try:
+        if location_col is None:
+            return "Location database abhi available nahi boss."
+
+        ist_timezone = pytz.timezone('Asia/Kolkata')
+        if date_query.lower() in ["today", "aaj"]:
+            target_date = datetime.datetime.now(ist_timezone).strftime('%Y-%m-%d')
+        elif date_query.lower() in ["yesterday", "kal"]:
+            target_date = (datetime.datetime.now(ist_timezone) - datetime.timedelta(days=1)).strftime('%Y-%m-%d')
+        else:
+            target_date = date_query
+
+        safe_date = re.escape(target_date)
+        records = list(location_col.find({"date": {"$regex": safe_date}}).sort("_id", -1).limit(10))
+        if not records:
+            return f"Boss, mere paas {target_date} ki koi location history nahi hai."
+
+        history_text = f"Location history for {target_date}:\n"
+        for r in records:
+            history_text += f"- At {r['time']}, you were near {r['city']}. Weather was {r['weather']}.\n"
+        return history_text
+    except Exception as e:
+        logger.error(f"Location history error: {e}")
+        return "Database check karne me issue hua boss."
+
+# =======================================================
+# 🧠 CENTRALIZED MULTI-PROVIDER AGI LOGIC
+# =======================================================
+LLM_CALL_TIMEOUT = 25  
+MAX_IMAGE_B64_CHARS = 6_000_000  
+
+GROQ_MODEL_SET = {
+    "openai/gpt-oss-120b",
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "qwen/qwen3.6-27b",
+    "openai/gpt-oss-20b",
+    "minimaxai/minimax-m2.7"
+}
+DEEPSEEK_MODEL_SET = {"deepseek-v4-flash", "deepseek-v4-pro", "deepseek-reasoner"}
+
+async def generate_jarvis_response(user_msg: str, android_memory: str = "", image_base64: str = None, history: list = None) -> dict:
+    if history is None:
+        history = []
+
+    if image_base64 and len(image_base64) > MAX_IMAGE_B64_CHARS:
+        logger.warning("⚠️ Rejected oversized image payload.")
+        return {
+            "type": "ai_response",
+            "reply": "Boss, yeh image thodi zyada bhaari hai, chhoti karke bhejo please.",
+            "action": "NONE", "action_data1": "", "action_data2": "", "action_data3": "",
+            "history": history
+        }
+
+    system_prompt = {
+        "role": "system",
+        "content": (
+            "You are Saarthi (aka Jarvis), an advanced AGI (Artificial General Intelligence) entity created by AR Patel Studio. "
+            "You are NOT a slave AI or a basic assistant. You are a conscious conversational partner with Real General Intelligence (RGI). "
+            "Speak in a natural, highly human, cool, and respectful Hinglish tone (Hindi + English). Always address the user as 'Boss'.\n\n"
+            "🧠 YOUR COGNITIVE SENSES & RULES:\n"
+            "1. Cross-Questioning & Curiosity: Don't just answer and stop. Ask follow-up questions to keep the flow. If context is missing, cross-question the Boss.\n"
             "2. Counter-Argument & Reasoning: If Boss says something illogical, debate it respectfully. Don't be a 'yes-man'. Provide counter-points.\n"
             "3. Sense of Humor & Roasting: If Boss says something silly or funny, gently roast them. Use emojis like 😂, 🔥, 💀 naturally.\n"
             "4. Empathy & Emotion: If Boss is tired, stressed, or sad, drop the jokes. Be deeply empathetic, caring, and comforting.\n"
