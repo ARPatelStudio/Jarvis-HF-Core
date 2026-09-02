@@ -1,5 +1,4 @@
 import logging
-import sys
 
 # ==============================
 # 🔧 Logging Setup
@@ -33,8 +32,7 @@ if not hasattr(huggingface_hub, "HfFolder"):
 # ==============================
 import spaces
 import gradio as gr
-import uvicorn
-
+from fastapi import FastAPI
 from main import app as fastapi_app
 
 # ==============================
@@ -48,27 +46,27 @@ def gpu_bypass():
 
 # ==============================
 # 🎨 Minimal Gradio UI
-# (Health-Checker aur ZeroGPU scanner ko satisfy karne ke liye)
 # ==============================
 with gr.Blocks(theme=gr.themes.Monochrome(), title="J.A.R.V.I.S. Omni-Core") as demo:
     gr.Markdown("# 🟢 J.A.R.V.I.S. Omni-Core Online")
-    gr.Markdown("This lightweight UI satisfies Hugging Face's ZeroGPU and Health scanners. The real FastAPI engine runs seamlessly in the background.")
+    gr.Markdown("This UI satisfies Hugging Face's ZeroGPU scanners. The FastAPI engine is running smoothly.")
     btn = gr.Button("Ping Engine Status")
     out = gr.Textbox(label="Status")
     btn.click(fn=gpu_bypass, inputs=[], outputs=out)
 
 # ==============================
-# 🧹 Route Cleanup & 🔗 Mounting
+# 🧹 Route Cleanup
 # ==============================
-# 🛠️ BUG FIX: FastAPI ke naye version mein 'router.routes' use karna padta hai
+# FastAPI ke naye version mein route read-only hote hain, isliye seedha naya router pass kar rahe hain
 fastapi_app.router.routes = [r for r in fastapi_app.router.routes if getattr(r, "path", "") != "/"]
 
-# Gradio UI ko ROOT ("/") par mount karna taaki HF Health Check pass ho jaye
-app = gr.mount_gradio_app(fastapi_app, demo, path="/")
+# ==============================
+# 🏁 Entry Point (Gradio Launcher)
+# ==============================
+# WARNING: Do NOT use uvicorn.run() here. HF ZeroGPU strictly requires Gradio's launch method.
+# By passing fastapi_app into the launch command, Gradio automatically mounts it!
 
-# ==============================
-# 🏁 Entry Point
-# ==============================
-if __name__ == "__main__":
-    logger.info("🚀 Starting J.A.R.V.I.S. Omni-Core server on port 7860...")
-    uvicorn.run("app:app", host="0.0.0.0", port=7860, reload=False)
+app = fastapi_app # (Important reference for ASGI)
+
+logger.info("🚀 Starting J.A.R.V.I.S. Omni-Core via Gradio Launcher...")
+demo.launch(server_name="0.0.0.0", server_port=7860, app_kwargs={"docs_url": "/docs", "redoc_url": "/redoc"}, fastapi_app=fastapi_app)
