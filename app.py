@@ -1,34 +1,30 @@
 import logging
 import sys
-import gradio as gr
-import uvicorn
-import spaces
 
 # ==============================
-# 🔧 Logging Setup
+# 🚀 HF Anti-Crash Monkey Patch (MUST BE FIRST!)
 # ==============================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("JarvisApp")
-
-# ==============================
-# 🚀 HF Anti-Crash Monkey Patch
-# ==============================
+# Gradio tries to import HfFolder, which was removed in newer huggingface_hub versions.
+# We must patch it BEFORE importing gradio.
 import huggingface_hub
 if not hasattr(huggingface_hub, "HfFolder"):
-    logger.warning("⚠️ Patching missing HfFolder in huggingface_hub...")
-    huggingface_hub.HfFolder = type("HfFolder", (), {"get_token": lambda: None})
+    class DummyHfFolder:
+        @staticmethod
+        def get_token():
+            return None
+    huggingface_hub.HfFolder = DummyHfFolder
 
 # ==============================
 # 📦 Core Imports
 # ==============================
-# Ensure your FastAPI app is imported correctly
+import spaces
+import gradio as gr
+import uvicorn
 from main import app as fastapi_app
 
 # ==============================
 # 🚀 ZeroGPU Decorated Function
 # ==============================
-# The AST scanner will detect this. When the button is clicked, 
-# ZeroGPU will dynamically allocate a GPU for this specific execution.
 @spaces.GPU
 def gpu_bypass():
     import torch
@@ -63,6 +59,8 @@ app = gr.mount_gradio_app(fastapi_app, demo, path="/ui")
 # 🏁 Entry Point
 # ==============================
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    logger = logging.getLogger("JarvisApp")
     logger.info("🚀 Starting J.A.R.V.I.S. Omni-Core server on port 7860...")
     
     # Start the unified FastAPI + Gradio application
