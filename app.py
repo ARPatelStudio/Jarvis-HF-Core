@@ -58,19 +58,12 @@ with gr.Blocks(theme=gr.themes.Monochrome(), title="J.A.R.V.I.S. Omni-Core") as 
     btn.click(fn=gpu_bypass, inputs=[], outputs=out)
 
 # ==============================
-# 🩺 Optional Health Check Route
-# ==============================
-@fastapi_app.get("/health")
-def health_check():
-    return {"status": "ok", "message": "J.A.R.V.I.S. Omni-Core is running."}
-
-# ==============================
 # 🧹 Route Cleanup & 🔗 Mounting
 # ==============================
-# Purane JSON root ("/") route ko delete karna taaki HF Health Checker se conflict na ho
-fastapi_app.routes = [r for r in fastapi_app.routes if getattr(r, "path", "") != "/"]
+# 🛠️ BUG FIX: FastAPI ke naye version mein 'router.routes' use karna padta hai
+fastapi_app.router.routes = [r for r in fastapi_app.router.routes if getattr(r, "path", "") != "/"]
 
-# Gradio UI ko ROOT ("/") par mount karna (YAHI MASTERSTROKE HAI)
+# Gradio UI ko ROOT ("/") par mount karna taaki HF Health Check pass ho jaye
 app = gr.mount_gradio_app(fastapi_app, demo, path="/")
 
 # ==============================
