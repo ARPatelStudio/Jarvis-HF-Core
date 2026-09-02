@@ -13,6 +13,7 @@ import struct
 import asyncio
 import tempfile
 import subprocess
+import threading
 from collections import defaultdict, deque
 from typing import List
 from fastapi import (
@@ -32,7 +33,6 @@ import cloudinary.uploader
 import firebase_admin
 from firebase_admin import credentials, messaging
 import pinecone
-from sentence_transformers import SentenceTransformer
 
 # ==========================================
 # 🪵 LOGS SETUP
@@ -41,6 +41,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 load_dotenv()
+
+os.environ.setdefault("HF_HOME", "/tmp/hf")
+os.environ.setdefault("TRANSFORMERS_CACHE", "/tmp/hf")
+os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", "/tmp/hf")
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
 START_TIME = time.time()
 
@@ -68,8 +73,8 @@ cloudinary.config(
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
 FCM_TARGET_TOKEN = os.getenv("FCM_TARGET_TOKEN")
 
-# Version bump: 51.1.0 (True Monolithic Zero-Deletion Architecture)
-app = FastAPI(title="Saarthi AGI Core", version="51.1.0")
+# Version bump: 51.1.1 (Lazy embedder so HF Space can bind port 7860)
+app = FastAPI(title="Saarthi AGI Core", version="51.1.1")
 
 # ==========================================
 # 🌐 CORS & RATE LIMITER
@@ -184,18 +189,34 @@ else:
     logger.error("🚨 MONGO_URI missing from environment variables! DB features disabled.")
 
 # ==========================================
-# 🌲 NATIVE PINECONE & EMBEDDER SETUP (Zero Bridge)
+# 🌲 NATIVE PINECONE & EMBEDDER SETUP (LAZY)
+# MiniLM is NOT loaded at import time — that was killing HF Space startup.
 # ==========================================
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX", "saarthi-index")
 pc_client = None
 pinecone_index = None
 embedder = None
+_embedder_lock = threading.Lock()
+
+def get_embedder():
+    """Load MiniLM only once, on first use / background warmup — never at import."""
+    global embedder
+    if embedder is None:
+        with _embedder_lock:
+            if embedder is None:
+                from sentence_transformers import SentenceTransformer
+                logger.info("⏳ Loading MiniLM embedder (lazy)...")
+                embedder = SentenceTransformer(
+                    "sentence-transformers/all-MiniLM-L6-v2",
+                    device="cpu"
+                )
+                logger.info("🟢 Embedder ready")
+    return embedder
 
 if PINECONE_API_KEY:
     try:
         pc_client = pinecone.Pinecone(api_key=PINECONE_API_KEY)
-        # Verify or connect to index
         existing_indexes = [idx.name for idx in pc_client.list_indexes()]
         if PINECONE_INDEX_NAME not in existing_indexes:
             logger.info(f"⏳ Creating Pinecone Index: {PINECONE_INDEX_NAME}...")
@@ -206,10 +227,9 @@ if PINECONE_API_KEY:
                 spec=pinecone.ServerlessSpec(cloud="aws", region="us-east-1")
             )
             logger.info("✅ Pinecone Index Created!")
-            
+
         pinecone_index = pc_client.Index(PINECONE_INDEX_NAME)
-        embedder = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
-        logger.info("🌲 Native Pinecone & Local AI Embedder Initialized Successfully!")
+        logger.info("🌲 Pinecone connected (embedder will load after server start)")
     except Exception as e:
         logger.error(f"🔴 Pinecone Initialization Error: {e}")
 
@@ -283,7 +303,7 @@ class DeleteRequest(BaseModel):
 
 @app.get("/")
 async def root():
-    return {"status": "🟢 Saarthi AGI Omni-Core is Online (V51.1.0 Monolithic)!", "service": "Cognitive Engine Active"}
+    return {"status": "🟢 Saarthi AGI Omni-Core is Online (V51.1.1 Monolithic)!", "service": "Cognitive Engine Active"}
 
 @app.get("/health")
 async def health_check():
@@ -298,6 +318,7 @@ async def health_check():
         "status": "ok",
         "mongo_connected": mongo_ok,
         "pinecone_linked": bool(pinecone_index),
+        "embedder_ready": embedder is not None,
         "n8n_automation_linked": bool(N8N_WEBHOOK_URL),
         "groq_api_key_set": bool(api_key),
     }
@@ -345,40 +366,42 @@ saarthi_tools = [
     {"type": "function", "function": {"name": "search_deep_memory", "description": "Search permanent memory for context matches.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
     {"type": "function", "function": {"name": "read_current_screen", "description": "Requests the Android device to read the text and buttons on the user's current screen invisibly using Accessibility. Use this when the user asks you to read, summarize, or interact with what is currently on their screen.", "parameters": {"type": "object", "properties": {}, "required": []}}},
     {"type": "function", "function": {
-        "name": "execute_universal_command", 
-        "description": "Executes ANY device action, app launch, media control, setting adjustment, or communication (call/message) on Android. Use your intelligence to infer the target.", 
+        "name": "execute_universal_command",
+        "description": "Executes ANY device action, app launch, media control, setting adjustment, or communication (call/message) on Android. Use your intelligence to infer the target.",
         "parameters": {
-            "type": "object", 
+            "type": "object",
             "properties": {
                 "category": {"type": "string", "enum": ["APP", "SETTING", "MEDIA", "COMMUNICATE", "SYSTEM", "VISION"]},
                 "target_name": {"type": "string", "description": "Name of app, setting, contact, or hardware (e.g., 'youtube', 'bluetooth', 'amit', 'flashlight')"},
                 "action_value": {"type": "string", "description": "The state or text message (e.g., 'on', 'off', '50%', 'Hello how are you')"}
-            }, 
+            },
             "required": ["category", "target_name"]
         }
     }},
     {"type": "function", "function": {
-        "name": "trigger_cloud_automation", 
-        "description": "Trigger a cloud automation workflow via n8n for heavy background tasks (e.g., database entry in Neon PostgreSQL, sending emails, web scraping, API sync).", 
+        "name": "trigger_cloud_automation",
+        "description": "Trigger a cloud automation workflow via n8n for heavy background tasks (e.g., database entry in Neon PostgreSQL, sending emails, web scraping, API sync).",
         "parameters": {
-            "type": "object", 
+            "type": "object",
             "properties": {
                 "workflow_name": {"type": "string", "description": "The name of the task (e.g., 'save_to_neon_db', 'send_email', 'scrape_website')"},
                 "payload_json": {"type": "string", "description": "JSON string containing the data needed for the workflow"}
-            }, 
+            },
             "required": ["workflow_name", "payload_json"]
         }
     }}
 ]
 
 def extract_json_object(raw_text: str):
-    if not raw_text: return None
+    if not raw_text:
+        return None
     decoder = json.JSONDecoder()
     idx = 0
     length = len(raw_text)
     while idx < length:
         start = raw_text.find('{', idx)
-        if start == -1: return None
+        if start == -1:
+            return None
         try:
             obj, _ = decoder.raw_decode(raw_text, start)
             return obj
@@ -395,7 +418,7 @@ def trigger_n8n_webhook(workflow_name: str, payload_str: str):
     try:
         try:
             payload = json.loads(payload_str)
-        except:
+        except Exception:
             payload = {"raw_text": payload_str}
 
         data = {
@@ -404,7 +427,7 @@ def trigger_n8n_webhook(workflow_name: str, payload_str: str):
             "timestamp": datetime.datetime.now().isoformat()
         }
         res = requests.post(N8N_WEBHOOK_URL, json=data, timeout=10)
-        
+
         if res.status_code == 200:
             return f"Cloud automation '{workflow_name}' triggered successfully via n8n!"
         return f"n8n webhook failed with status {res.status_code}."
@@ -465,8 +488,8 @@ def query_location_history(date_query: str):
 # =======================================================
 # 🧠 CENTRALIZED MULTI-PROVIDER AGI LOGIC
 # =======================================================
-LLM_CALL_TIMEOUT = 25  
-MAX_IMAGE_B64_CHARS = 6_000_000  
+LLM_CALL_TIMEOUT = 25
+MAX_IMAGE_B64_CHARS = 6_000_000
 
 GROQ_MODEL_SET = {
     "openai/gpt-oss-120b",
@@ -539,7 +562,7 @@ async def generate_jarvis_response(user_msg: str, android_memory: str = "", imag
             }
             vision_messages = messages + [vision_message]
             raw_reply = None
-            
+
             try:
                 response = await asyncio.wait_for(
                     client.chat.completions.create(
@@ -561,7 +584,7 @@ async def generate_jarvis_response(user_msg: str, android_memory: str = "", imag
 
         else:
             messages.append({"role": "user", "content": user_msg})
-            
+
             response_message = None
             used_model = None
             client_used = None
@@ -578,7 +601,8 @@ async def generate_jarvis_response(user_msg: str, android_memory: str = "", imag
                         )
                         client_used = client
                     elif model_name in DEEPSEEK_MODEL_SET:
-                        if not deepseek_client: continue
+                        if not deepseek_client:
+                            continue
                         active_tools = saarthi_tools if "reasoner" not in model_name else None
                         response = await asyncio.wait_for(
                             deepseek_client.chat.completions.create(
@@ -588,7 +612,8 @@ async def generate_jarvis_response(user_msg: str, android_memory: str = "", imag
                         )
                         client_used = deepseek_client
                     else:
-                        if not openrouter_client: continue
+                        if not openrouter_client:
+                            continue
                         response = await asyncio.wait_for(
                             openrouter_client.chat.completions.create(
                                 model=model_name, messages=messages, tools=saarthi_tools, max_tokens=600, temperature=0.7
@@ -596,7 +621,7 @@ async def generate_jarvis_response(user_msg: str, android_memory: str = "", imag
                             timeout=LLM_CALL_TIMEOUT
                         )
                         client_used = openrouter_client
-                    
+
                     response_message = response.choices[0].message
                     used_model = model_name
                     logger.info(f"✅ AI Response generated successfully using: {used_model}")
@@ -604,7 +629,7 @@ async def generate_jarvis_response(user_msg: str, android_memory: str = "", imag
                 except Exception as e:
                     logger.warning(f"⚠️ Model {model_name} failed: {e}")
                     continue
-            
+
             if not response_message:
                 raise Exception("All AI models in the fallback swarm failed!")
 
@@ -656,8 +681,8 @@ async def generate_jarvis_response(user_msg: str, android_memory: str = "", imag
                         tool_result = f"Universal action {action_type} for {target} sent to Android."
                     elif func_name == "trigger_cloud_automation":
                         tool_result = await asyncio.to_thread(
-                            trigger_n8n_webhook, 
-                            args.get("workflow_name", "default_task"), 
+                            trigger_n8n_webhook,
+                            args.get("workflow_name", "default_task"),
                             args.get("payload_json", "{}")
                         )
 
@@ -687,7 +712,8 @@ async def generate_jarvis_response(user_msg: str, android_memory: str = "", imag
             pass
 
         history = history + [{"role": "user", "content": user_msg}, {"role": "assistant", "content": final_reply}]
-        if len(history) > 12: history = history[-12:]
+        if len(history) > 12:
+            history = history[-12:]
 
         return {
             "type": "ai_response", "reply": final_reply, "action": action_type,
@@ -722,10 +748,11 @@ async def save_vision_memory(image_b64: str, user_text: str, response_data: dict
             })
         doc_res = await asyncio.to_thread(db_insert)
 
-        if pinecone_index and embedder:
+        if pinecone_index:
             try:
                 def sync_upsert():
-                    vector = embedder.encode(mem_content).tolist()
+                    model = get_embedder()
+                    vector = model.encode(mem_content).tolist()
                     metadata = {"content": mem_content, "url": image_url, "type": "visual"}
                     pinecone_index.upsert(vectors=[{"id": str(doc_res.inserted_id), "values": vector, "metadata": metadata}])
                 await asyncio.to_thread(sync_upsert)
@@ -740,7 +767,8 @@ async def save_vision_memory(image_b64: str, user_text: str, response_data: dict
 # =======================================================
 def get_max_amplitude(pcm_bytes):
     count = len(pcm_bytes) // 2
-    if count == 0: return 0
+    if count == 0:
+        return 0
     samples = struct.unpack(f"<{count}h", pcm_bytes[:count * 2])
     return max(abs(s) for s in samples)
 
@@ -760,7 +788,8 @@ async def process_voice_buffer(audio_bytes: bytes, image_b64, websocket: WebSock
             timeout=LLM_CALL_TIMEOUT
         )
         user_text = transcription.text.strip()
-        if not user_text: return session_history
+        if not user_text:
+            return session_history
 
         logger.info(f"🗣️ User Said (Live): {user_text}")
         response_data = await generate_jarvis_response(user_msg=user_text, image_base64=image_b64, history=session_history)
@@ -791,8 +820,10 @@ async def live_chat_endpoint(websocket: WebSocket):
     try:
         while True:
             raw_data = await websocket.receive_text()
-            try: payload = json.loads(raw_data)
-            except: continue
+            try:
+                payload = json.loads(raw_data)
+            except Exception:
+                continue
 
             msg_type = payload.get("type")
 
@@ -809,7 +840,8 @@ async def live_chat_endpoint(websocket: WebSocket):
                 await manager.send_json({"type": "system", "reply": "Connection established with Monolithic AGI.", "action": "NONE"}, websocket)
                 continue
 
-            if not authenticated: continue
+            if not authenticated:
+                continue
 
             if msg_type == "audio_stream":
                 b64_audio = payload.get("data")
@@ -819,8 +851,10 @@ async def live_chat_endpoint(websocket: WebSocket):
                     latest_received_image = b64_image
 
                 if b64_audio:
-                    try: pcm_bytes = base64.b64decode(b64_audio)
-                    except: continue
+                    try:
+                        pcm_bytes = base64.b64decode(b64_audio)
+                    except Exception:
+                        continue
                     amplitude = get_max_amplitude(pcm_bytes)
                     audio_buffer.extend(pcm_bytes)
 
@@ -828,7 +862,8 @@ async def live_chat_endpoint(websocket: WebSocket):
                         is_speaking = True
                         last_voice_time = time.time()
 
-                    if not is_speaking and len(audio_buffer) > 32000: audio_buffer.clear()
+                    if not is_speaking and len(audio_buffer) > 32000:
+                        audio_buffer.clear()
                     force_flush = len(audio_buffer) > MAX_BUFFER_BYTES
                     silence_timeout = is_speaking and (time.time() - last_voice_time > MAX_SILENCE_DURATION)
 
@@ -869,9 +904,11 @@ async def synthesize_speech(req: SynthesizeReq):
                 subprocess.run(["piper", "--model", model_path, "--output_file", out_path], input=text.encode("utf-8"), timeout=30, check=True)
             try:
                 await asyncio.to_thread(run_piper)
-                with open(out_path, "rb") as f: audio_bytes = f.read()
+                with open(out_path, "rb") as f:
+                    audio_bytes = f.read()
             finally:
-                if os.path.exists(out_path): os.remove(out_path)
+                if os.path.exists(out_path):
+                    os.remove(out_path)
             return Response(content=audio_bytes, media_type="audio/wav")
         else:
             from gtts import gTTS
@@ -1051,10 +1088,11 @@ async def save_deep_memory(req: DeepMemorySaveReq):
             })
         doc_res = await asyncio.to_thread(db_insert)
 
-        if pinecone_index and embedder:
+        if pinecone_index:
             try:
                 def sync_upsert():
-                    vector = embedder.encode(req.content).tolist()
+                    model = get_embedder()
+                    vector = model.encode(req.content).tolist()
                     metadata = {"content": req.content, "type": req.mem_type}
                     pinecone_index.upsert(vectors=[{"id": str(doc_res.inserted_id), "values": vector, "metadata": metadata}])
                 await asyncio.to_thread(sync_upsert)
@@ -1091,17 +1129,21 @@ async def action_deep_memory(req: DeepMemoryActionReq):
     try:
         obj_id = ObjectId(req.mem_id)
         def db_op():
-            if req.action == "delete": deep_mem_col.delete_one({"_id": obj_id})
+            if req.action == "delete":
+                deep_mem_col.delete_one({"_id": obj_id})
             elif req.action == "pin":
                 doc = deep_mem_col.find_one({"_id": obj_id})
-                if doc: deep_mem_col.update_one({"_id": obj_id}, {"$set": {"is_pinned": not doc.get("is_pinned", False)}})
+                if doc:
+                    deep_mem_col.update_one({"_id": obj_id}, {"$set": {"is_pinned": not doc.get("is_pinned", False)}})
             elif req.action == "rename":
                 deep_mem_col.update_one({"_id": obj_id}, {"$set": {"custom_name": req.new_name}})
         await asyncio.to_thread(db_op)
 
         if req.action == "delete" and pinecone_index:
-            try: await asyncio.to_thread(pinecone_index.delete, ids=[req.mem_id])
-            except Exception as e: logger.error(f"🔴 Pinecone Delete Error: {e}")
+            try:
+                await asyncio.to_thread(pinecone_index.delete, ids=[req.mem_id])
+            except Exception as e:
+                logger.error(f"🔴 Pinecone Delete Error: {e}")
         return {"success": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1109,14 +1151,16 @@ async def action_deep_memory(req: DeepMemoryActionReq):
 def search_deep_memory(query: str):
     try:
         results_str = []
-        if pinecone_index and embedder:
+        if pinecone_index:
             try:
-                query_vector = embedder.encode(query).tolist()
+                model = get_embedder()
+                query_vector = model.encode(query).tolist()
                 res = pinecone_index.query(vector=query_vector, top_k=3, include_metadata=True)
                 for match in res.get('matches', []):
                     score = round(match.get('score', 0), 2)
                     meta = match.get('metadata', {})
-                    if score > 0.4: results_str.append(f"- [SEMANTIC MATCH - Confidence {score}] {meta.get('content', '')}")
+                    if score > 0.4:
+                        results_str.append(f"- [SEMANTIC MATCH - Confidence {score}] {meta.get('content', '')}")
             except Exception as ve_err:
                 logger.error(f"🔴 Pinecone Search Error: {ve_err}")
 
@@ -1127,7 +1171,8 @@ def search_deep_memory(query: str):
             for r in records:
                 results_str.append(f"- [{r.get('type', 'TEXT').upper()}] Date: {r.get('date', '')}. Detail: {r.get('content', '')}")
 
-        if not results_str: return "Deep memory mein is se judi koi jankari nahi mili boss."
+        if not results_str:
+            return "Deep memory mein is se judi koi jankari nahi mili boss."
         seen = set()
         ordered_unique = []
         for item in results_str:
@@ -1141,12 +1186,13 @@ def search_deep_memory(query: str):
 # Vector API Endpoints Ported from Render 2
 @app.post("/upsert", dependencies=[Depends(verify_api_key)])
 def upsert_vector(req: UpsertRequest):
-    if not pinecone_index or not embedder:
+    if not pinecone_index:
         raise HTTPException(status_code=503, detail="Pinecone or Embed Model not configured")
     try:
-        vector = embedder.encode(req.text).tolist()
+        model = get_embedder()
+        vector = model.encode(req.text).tolist()
         meta = req.metadata
-        meta["text_content"] = req.text 
+        meta["text_content"] = req.text
         pinecone_index.upsert(vectors=[{"id": req.id, "values": vector, "metadata": meta}])
         return {"success": True, "message": "Memory embedded and locked in Pinecone."}
     except Exception as e:
@@ -1154,10 +1200,11 @@ def upsert_vector(req: UpsertRequest):
 
 @app.post("/search", dependencies=[Depends(verify_api_key)])
 def search_vector(req: SearchRequest):
-    if not pinecone_index or not embedder:
+    if not pinecone_index:
         raise HTTPException(status_code=503, detail="Pinecone or Embed Model not configured")
     try:
-        vector = embedder.encode(req.query).tolist()
+        model = get_embedder()
+        vector = model.encode(req.query).tolist()
         res = pinecone_index.query(vector=vector, top_k=req.top_k, include_metadata=True)
         matches = [{"id": m["id"], "score": m["score"], "metadata": m.get("metadata", {})} for m in res.get("matches", [])]
         return {"matches": matches}
@@ -1178,11 +1225,11 @@ def delete_vector(req: DeleteRequest):
 async def handle_remote_command(payload: RemoteCommandPayload, x_api_key: str = Header(None)):
     if SAARTHI_API_KEY and x_api_key != SAARTHI_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized Boss")
-    
+
     alert_msg = {"type": "ai_response", "reply": payload.command, "action": payload.type, "action_data1": "", "action_data2": ""}
     response_logs = []
     try:
-        await manager.broadcast(json.dumps(alert_msg)) 
+        await manager.broadcast(json.dumps(alert_msg))
         response_logs.append("WebSocket Broadcast: Success")
         if FCM_TARGET_TOKEN:
             try:
@@ -1209,6 +1256,8 @@ async def global_exception_handler(request: Request, exc: Exception):
 async def startup_event():
     logger.info("🚀 Saarthi AGI Monolithic Core booting up...")
     asyncio.create_task(cleanup_rate_limiter())
+    # Port already bound by this point. Warm embedder in background so first /search isn't slow.
+    asyncio.create_task(asyncio.to_thread(get_embedder))
 
 @app.on_event("shutdown")
 def shutdown_event():
