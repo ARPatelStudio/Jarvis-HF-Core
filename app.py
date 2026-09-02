@@ -62,4 +62,4 @@ app = gr.mount_gradio_app(fastapi_app, demo, path="/ui")
 # ==============================
 if __name__ == "__main__":
     logger.info("🚀 Starting J.A.R.V.I.S. Omni-Core server on port 7860...")
-    uvicorn.run("app:app", host="0.0.0.0", port=7860)
+    uvicorn.run("app:app", host="0.0.0.0", port=7860, reload=False)
