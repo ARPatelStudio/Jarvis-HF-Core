@@ -1,8 +1,8 @@
 import logging
 import sys
-import threading
-import time
-import requests
+import gradio as gr
+import uvicorn
+import spaces
 
 # ==============================
 # 🔧 Logging Setup
@@ -21,49 +21,43 @@ if not hasattr(huggingface_hub, "HfFolder"):
 # ==============================
 # 📦 Core Imports
 # ==============================
-import spaces
-import gradio as gr
-import uvicorn
+# Ensure your FastAPI app is imported correctly
 from main import app as fastapi_app
 
 # ==============================
-# 🚀 Dummy GPU Function (To fool the AST Scanner)
+# 🚀 ZeroGPU Decorated Function
 # ==============================
+# The AST scanner will detect this. When the button is clicked, 
+# ZeroGPU will dynamically allocate a GPU for this specific execution.
 @spaces.GPU
 def gpu_bypass():
-    return "ZeroGPU Bypassed! CPU Engine Active."
+    import torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    return f"ZeroGPU Active! Engine running on: {device.upper()}"
 
 # ==============================
 # 🎨 Minimal Gradio UI
 # ==============================
 with gr.Blocks(theme=gr.themes.Monochrome(), title="J.A.R.V.I.S. Omni-Core") as demo:
     gr.Markdown("# 🟢 J.A.R.V.I.S. Omni-Core is Live")
+    gr.Markdown("System initialized. FastAPI backend is running in the background.")
+    
     btn = gr.Button("Ping Engine Status")
     out = gr.Textbox(label="Status")
+    
+    # Link the button to the GPU-decorated function
     btn.click(fn=gpu_bypass, inputs=[], outputs=out)
 
 # ==============================
-# 🔗 Safely Mount Gradio UI
+# ⚠️ CRITICAL: Enable Gradio Queue
 # ==============================
-app = gr.mount_gradio_app(fastapi_app, demo, path="/ui")
+# ZeroGPU WILL NOT WORK and will crash without the queue enabled.
+demo.queue()
 
 # ==============================
-# 👻 THE GHOST SIGNAL (HF Kill-Switch Bypass)
+# 🔗 Safely Mount Gradio UI to FastAPI
 # ==============================
-def send_ghost_startup_signal():
-    """Waits for 3 seconds, then manually pings HF's hidden ZeroGPU API"""
-    time.sleep(3)
-    try:
-        import spaces.zero.client
-        spaces.zero.client.startup_report()
-        logger.info("✅ GHOST SIGNAL SENT: Hugging Face ZeroGPU Security Bypassed!")
-    except Exception:
-        try:
-            # Direct HTTP POST attack on their internal container network
-            requests.post("http://device-api.zero/startup-report", timeout=5)
-            logger.info("✅ GHOST HTTP POST SENT: ZeroGPU Security Bypassed!")
-        except Exception as e:
-            logger.warning(f"⚠️ Ghost signal skipped: {e}")
+app = gr.mount_gradio_app(fastapi_app, demo, path="/ui")
 
 # ==============================
 # 🏁 Entry Point
@@ -71,8 +65,5 @@ def send_ghost_startup_signal():
 if __name__ == "__main__":
     logger.info("🚀 Starting J.A.R.V.I.S. Omni-Core server on port 7860...")
     
-    # Start the ghost signal in the background
-    threading.Thread(target=send_ghost_startup_signal, daemon=True).start()
-    
-    # Start the powerful FastAPI engine (No double-imports, purely clean!)
+    # Start the unified FastAPI + Gradio application
     uvicorn.run(app, host="0.0.0.0", port=7860)
