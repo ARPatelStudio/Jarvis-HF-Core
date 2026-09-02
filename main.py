@@ -208,7 +208,7 @@ if PINECONE_API_KEY:
             logger.info("✅ Pinecone Index Created!")
             
         pinecone_index = pc_client.Index(PINECONE_INDEX_NAME)
-        embedder = SentenceTransformer('all-MiniLM-L6-v2')
+        embedder = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
         logger.info("🌲 Native Pinecone & Local AI Embedder Initialized Successfully!")
     except Exception as e:
         logger.error(f"🔴 Pinecone Initialization Error: {e}")
