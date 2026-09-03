@@ -14,11 +14,15 @@ if not hasattr(huggingface_hub, "HfFolder"):
         }
     )
 
-# 📦 3. Standard Imports
+# 📦 3. Standard & New Imports (Merged Safely)
 import logging
 import spaces
 import gradio as gr
 import uvicorn
+import asyncio
+import os
+from fastapi import FastAPI, Header, HTTPException, Request
+from pydantic import BaseModel
 from main import app as fastapi_app
 
 # ==============================
@@ -33,6 +37,58 @@ logger = logging.getLogger("JarvisApp")
 @spaces.GPU
 def gpu_bypass():
     return "ZeroGPU Bypassed! CPU Engine Active."
+
+# =========================================================================
+# 🌐 N8N & REMOTE COMMAND SYSTEM (NEWLY ADDED)
+# =========================================================================
+# J.A.R.V.I.S Security Key (Matches Android & n8n)
+MASTER_KEY = "AmitPatel_Jarvis_Core_2026" 
+
+# Global variable to store the latest silent command
+latest_remote_command = None 
+
+# Pydantic Model for incoming n8n request
+class RemoteCommandReq(BaseModel):
+    target_user: str
+    command: str
+    type: str
+    sender: str
+
+# 🚀 N8N TO HUGGING FACE ROUTER
+@fastapi_app.post("/api/remote_command")
+async def receive_remote_command(req: RemoteCommandReq, x_api_key: str = Header(None)):
+    global latest_remote_command
+    
+    # 1. Security Check
+    if x_api_key != MASTER_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized Access to Omni-Core")
+        
+    # 2. Store the command so WebSocket/Android can fetch it
+    latest_remote_command = {
+        "command": req.command,
+        "type": req.type,
+        "sender": req.sender
+    }
+    
+    logger.info(f"📥 Received Remote Command from {req.sender}: {req.command}")
+    
+    return {"status": "success", "message": "Command received and queued."}
+
+# 🚀 ANDROID FETCH ROUTE
+@fastapi_app.get("/api/get_remote_command")
+async def fetch_remote_command(x_api_key: str = Header(None)):
+    global latest_remote_command
+    
+    if x_api_key != MASTER_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+        
+    if latest_remote_command:
+        # Fetch and clear the queue
+        cmd = latest_remote_command
+        latest_remote_command = None
+        return {"has_command": True, "data": cmd}
+    else:
+        return {"has_command": False}
 
 # ==============================
 # 🎨 Minimal Gradio UI
