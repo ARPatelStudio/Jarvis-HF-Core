@@ -49,6 +49,9 @@ os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
 START_TIME = time.time()
 
+# 🚀 GLOBAL VARIABLE FOR REMOTE COMMAND FETCHING
+latest_remote_command = None
+
 # ==========================================
 # 🔥 FIREBASE ADMIN SETUP (Deep Sleep Pushes)
 # ==========================================
@@ -73,8 +76,8 @@ cloudinary.config(
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
 FCM_TARGET_TOKEN = os.getenv("FCM_TARGET_TOKEN")
 
-# Version bump: 51.1.1 (Lazy embedder so HF Space can bind port 7860)
-app = FastAPI(title="Saarthi AGI Core", version="51.1.1")
+# Version bump: 51.1.2 (Lazy embedder + Advanced Remote Command Queue)
+app = FastAPI(title="Saarthi AGI Core", version="51.1.2")
 
 # ==========================================
 # 🌐 CORS & RATE LIMITER
@@ -190,7 +193,6 @@ else:
 
 # ==========================================
 # 🌲 NATIVE PINECONE & EMBEDDER SETUP (LAZY)
-# MiniLM is NOT loaded at import time — that was killing HF Space startup.
 # ==========================================
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX", "saarthi-index")
@@ -200,7 +202,6 @@ embedder = None
 _embedder_lock = threading.Lock()
 
 def get_embedder():
-    """Load MiniLM only once, on first use / background warmup — never at import."""
     global embedder
     if embedder is None:
         with _embedder_lock:
@@ -288,7 +289,7 @@ class RemoteCommandPayload(BaseModel):
     type: str
     sender: str
 
-# Vector API Models (Ported from Render 2)
+# Vector API Models
 class UpsertRequest(BaseModel):
     id: str
     text: str
@@ -303,7 +304,7 @@ class DeleteRequest(BaseModel):
 
 @app.get("/")
 async def root():
-    return {"status": "🟢 Saarthi AGI Omni-Core is Online (V51.1.1 Monolithic)!", "service": "Cognitive Engine Active"}
+    return {"status": "🟢 Saarthi AGI Omni-Core is Online (V51.1.2 Monolithic)!", "service": "Cognitive Engine Active"}
 
 @app.get("/health")
 async def health_check():
@@ -1221,16 +1222,32 @@ def delete_vector(req: DeleteRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# =======================================================
+# 🚀 ENDPOINT: J.A.R.V.I.S. Push Alert Receiver (FCM + WEBSOCKET + QUEUE)
+# =======================================================
 @app.post("/api/remote_command")
 async def handle_remote_command(payload: RemoteCommandPayload, x_api_key: str = Header(None)):
+    global latest_remote_command
+    
+    # 1. Security Check
     if SAARTHI_API_KEY and x_api_key != SAARTHI_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized Boss")
+
+    # 2. Queue command for Android GET fetching (If offline)
+    latest_remote_command = {
+        "command": payload.command,
+        "type": payload.type,
+        "sender": payload.sender
+    }
 
     alert_msg = {"type": "ai_response", "reply": payload.command, "action": payload.type, "action_data1": "", "action_data2": ""}
     response_logs = []
     try:
+        # 3. Live Mode (WebSocket)
         await manager.broadcast(json.dumps(alert_msg))
         response_logs.append("WebSocket Broadcast: Success")
+        
+        # 4. DEEP SLEEP FIREBASE PUSH
         if FCM_TARGET_TOKEN:
             try:
                 message = messaging.Message(
@@ -1243,9 +1260,28 @@ async def handle_remote_command(payload: RemoteCommandPayload, x_api_key: str = 
                 response_logs.append(f"FCM Push Failed: {fcm_err}")
         else:
             response_logs.append("FCM Push Skipped: Token not found in Environment Variables")
-        return {"status": "success", "message": "Alert processed", "details": response_logs}
+            
+        return {"status": "success", "message": "Alert processed and queued", "details": response_logs}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to transmit: {str(e)}")
+
+# =======================================================
+# 🚀 NEW ENDPOINT: ANDROID FETCH ROUTE
+# =======================================================
+@app.get("/api/get_remote_command")
+async def fetch_remote_command(x_api_key: str = Header(None)):
+    global latest_remote_command
+    
+    if SAARTHI_API_KEY and x_api_key != SAARTHI_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized Boss")
+        
+    if latest_remote_command:
+        # Fetch and clear the queue
+        cmd = latest_remote_command
+        latest_remote_command = None
+        return {"has_command": True, "data": cmd}
+    else:
+        return {"has_command": False}
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
