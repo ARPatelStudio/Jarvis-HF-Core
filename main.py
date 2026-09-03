@@ -75,9 +75,10 @@ cloudinary.config(
 # 🚀 SYSTEM URLS & TOKENS
 N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL")
 FCM_TARGET_TOKEN = os.getenv("FCM_TARGET_TOKEN")
+NEON_DB_URL = os.getenv("NEON_DB_URL") # 🚀 NAYA: Neon DB Connection for Finance Sync
 
-# Version bump: 51.1.2 (Lazy embedder + Advanced Remote Command Queue)
-app = FastAPI(title="Saarthi AGI Core", version="51.1.2")
+# Version bump: 51.1.3 (Omni-Fetch Two-Way DB Sync Integrated)
+app = FastAPI(title="Saarthi AGI Core", version="51.1.3")
 
 # ==========================================
 # 🌐 CORS & RATE LIMITER
@@ -304,7 +305,7 @@ class DeleteRequest(BaseModel):
 
 @app.get("/")
 async def root():
-    return {"status": "🟢 Saarthi AGI Omni-Core is Online (V51.1.2 Monolithic)!", "service": "Cognitive Engine Active"}
+    return {"status": "🟢 Saarthi AGI Omni-Core is Online (V51.1.3 Monolithic)!", "service": "Cognitive Engine Active"}
 
 @app.get("/health")
 async def health_check():
@@ -321,6 +322,7 @@ async def health_check():
         "pinecone_linked": bool(pinecone_index),
         "embedder_ready": embedder is not None,
         "n8n_automation_linked": bool(N8N_WEBHOOK_URL),
+        "neon_db_linked": bool(NEON_DB_URL),
         "groq_api_key_set": bool(api_key),
     }
 
@@ -381,14 +383,27 @@ saarthi_tools = [
     }},
     {"type": "function", "function": {
         "name": "trigger_cloud_automation",
-        "description": "Trigger a cloud automation workflow via n8n for heavy background tasks (e.g., database entry in Neon PostgreSQL, sending emails, web scraping, API sync).",
+        "description": "Trigger a cloud automation workflow via n8n for heavy background tasks (e.g., sending emails, web scraping, API sync). Does NOT read finance data.",
         "parameters": {
             "type": "object",
             "properties": {
-                "workflow_name": {"type": "string", "description": "The name of the task (e.g., 'save_to_neon_db', 'send_email', 'scrape_website')"},
+                "workflow_name": {"type": "string", "description": "The name of the task (e.g., 'send_email', 'scrape_website')"},
                 "payload_json": {"type": "string", "description": "JSON string containing the data needed for the workflow"}
             },
             "required": ["workflow_name", "payload_json"]
+        }
+    }},
+    # 🚀 NAYA: Omni-Fetch Tool (Direct Finance Sync via Neon DB)
+    {"type": "function", "function": {
+        "name": "manage_finance_database",
+        "description": "Read, set, or update the user's monthly budget and calculate total expenses directly from Neon PostgreSQL DB.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["GET_BUDGET", "SET_BUDGET", "INCREASE_BUDGET", "GET_EXPENSES"]},
+                "amount": {"type": "number", "description": "The amount to set or add to the budget (use 0 if just fetching)."}
+            },
+            "required": ["action"]
         }
     }}
 ]
@@ -435,6 +450,68 @@ def trigger_n8n_webhook(workflow_name: str, payload_str: str):
     except Exception as e:
         logger.error(f"n8n Webhook error: {e}")
         return "Failed to trigger cloud automation. Server might be down."
+
+# 🚀 NAYA: The Omni-Fetch PostgreSQL Controller
+def execute_finance_db_action(action: str, amount: float = 0.0):
+    if not NEON_DB_URL:
+        return "Boss, Neon DB connection string missing hai. Main database se connect nahi kar paa raha hoon."
+    
+    try:
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+        
+        conn = psycopg2.connect(NEON_DB_URL)
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        if action == "GET_BUDGET":
+            cursor.execute("SELECT amount FROM jarvis_budgets WHERE category = 'monthly_limit';")
+            res = cursor.fetchone()
+            budget = res['amount'] if res else 0
+            conn.close()
+            return f"Current monthly budget limit is {budget}."
+            
+        elif action == "SET_BUDGET":
+            cursor.execute("""
+                INSERT INTO jarvis_budgets (category, amount)
+                VALUES ('monthly_limit', %s)
+                ON CONFLICT (category) DO UPDATE SET amount = EXCLUDED.amount, updated_at = NOW();
+            """, (amount,))
+            conn.commit()
+            conn.close()
+            return f"Boss, budget successfully set to {amount}."
+            
+        elif action == "INCREASE_BUDGET":
+            cursor.execute("""
+                UPDATE jarvis_budgets
+                SET amount = amount + %s, updated_at = NOW()
+                WHERE category = 'monthly_limit'
+                RETURNING amount;
+            """, (amount,))
+            res = cursor.fetchone()
+            new_budget = res['amount'] if res else amount
+            conn.commit()
+            conn.close()
+            return f"Boss, budget increased by {amount}. The new total budget limit is {new_budget}."
+            
+        elif action == "GET_EXPENSES":
+            cursor.execute("""
+                SELECT SUM(amount) as total_spent FROM jarvis_expenses
+                WHERE date_trunc('month', transaction_date) = date_trunc('month', CURRENT_DATE);
+            """)
+            res = cursor.fetchone()
+            total_spent = res['total_spent'] if res and res['total_spent'] else 0
+            conn.close()
+            return f"Boss, total expenses this month so far is {total_spent}."
+            
+        else:
+            conn.close()
+            return "Unknown finance action."
+            
+    except ImportError:
+        return "psycopg2 library is missing in Omni-Core. Cannot execute SQL."
+    except Exception as e:
+        logger.error(f"Finance DB Error: {e}")
+        return f"Neon Database error boss: {str(e)}"
 
 def perform_web_search(query: str):
     try:
@@ -685,6 +762,13 @@ async def generate_jarvis_response(user_msg: str, android_memory: str = "", imag
                             trigger_n8n_webhook,
                             args.get("workflow_name", "default_task"),
                             args.get("payload_json", "{}")
+                        )
+                    # 🚀 NAYA: Handling the Omni-Fetch Finance Database Execution
+                    elif func_name == "manage_finance_database":
+                        tool_result = await asyncio.to_thread(
+                            execute_finance_db_action,
+                            args.get("action", "GET_BUDGET"),
+                            float(args.get("amount", 0.0))
                         )
 
                     messages.append({"role": "tool", "tool_call_id": tool_call.id, "name": func_name, "content": tool_result})
