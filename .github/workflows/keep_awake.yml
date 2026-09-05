@@ -1,0 +1,17 @@
+name: Anti-Sleep Protocol
+
+on:
+  schedule:
+    - cron: "*/15 * * * *" # Har 15 minute mein trigger hoga
+  workflow_dispatch:
+
+jobs:
+  ping-space:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Jarvis Master Core
+        run: |
+          echo "Waking up Jarvis HF Core..."
+          # DHYAN DEIN: Agar aapke HF Space ka URL kuch aur hai toh isey update kar lein
+          curl -s https://favouritegamer-Jarvis-Omni-Core.hf.space > /dev/null
+          echo "Ping successful!"
